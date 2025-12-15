@@ -113,6 +113,13 @@ def main():
     logger.info("=" * 60)
     logger.info("🚀 QUANT ANALYTICS APP - Waiting for START signal")
     logger.info("=" * 60)
+    
+    # CRITICAL: Clear any stale control file from previous session
+    # This prevents auto-starting from old START signals
+    if CONTROL_PATH.exists():
+        CONTROL_PATH.unlink()
+        logger.info("🧹 Cleared stale control.json")
+    
     logger.info("Open Streamlit UI and click START to begin.")
     logger.info("-" * 60)
     
@@ -244,17 +251,20 @@ def main():
                         f"ρ={snapshot['correlation']:.2f}"
                     )
                 else:
-                    x_count = buffer.get_count(symbol_x)
-                    y_count = buffer.get_count(symbol_y)
+                    # Get actual buffer lengths (capped by deque maxlen)
+                    x_len = min(buffer.get_count(symbol_x), window_size)
+                    y_len = min(buffer.get_count(symbol_y), window_size)
                     
-                    if x_count == 0 and y_count == 0:
+                    if x_len == 0 and y_len == 0:
                         logger.info(f"⏳ Waiting for data... {symbol_x.upper()}, {symbol_y.upper()}")
                     else:
-                        pct_x = min(100, int(x_count / window_size * 100))
-                        pct_y = min(100, int(y_count / window_size * 100))
+                        # Show status for each symbol
+                        x_status = "READY" if x_len >= window_size else f"{x_len}/{window_size} ({int(x_len/window_size*100)}%)"
+                        y_status = "READY" if y_len >= window_size else f"{y_len}/{window_size} ({int(y_len/window_size*100)}%)"
+                        
                         logger.info(
-                            f"⏳ Buffering: {symbol_x.upper()} {x_count}/{window_size} ({pct_x}%) | "
-                            f"{symbol_y.upper()} {y_count}/{window_size} ({pct_y}%)"
+                            f"⏳ Buffering: {symbol_x.upper()} {x_status} | "
+                            f"{symbol_y.upper()} {y_status}"
                         )
                 
                 last_analytics_run = now
