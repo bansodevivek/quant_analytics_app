@@ -15,10 +15,14 @@ UX Design:
 
 import time
 import json
+import datetime
+import numpy as np
 import streamlit as st
 import plotly.graph_objects as go
 import pandas as pd
 from pathlib import Path
+
+from analytics import run_adf_test, compute_half_life
 
 
 # ---------------- Page Config ----------------
@@ -35,6 +39,15 @@ if "pairs" not in st.session_state:
     st.session_state.pairs = []
 if "history" not in st.session_state:
     st.session_state.history = {}  # Dict of pair_id → list of snapshots
+if "diagnostics" not in st.session_state:
+    st.session_state.diagnostics = {}  # Dict of pair_id → {adf, half_life}
+if "pair_ready_once" not in st.session_state:
+    st.session_state.pair_ready_once = {}  # Sticky ready: once True, never reverts in UI
+if "render_ready" not in st.session_state:
+    st.session_state.render_ready = set()  # UI-side latch for instant chart render
+if "cached_df" not in st.session_state:
+    st.session_state.cached_df = {}  # Cache: (pair_id, version) → DataFrame
+
 
 
 # ---------------- Constants ----------------
@@ -383,23 +396,59 @@ def load_history():
 state_version, state = load_state()
 history = load_history()
 
-# FRAME SKIP: If JSON read failed (partial write), skip this render
+# FRAME SKIP: If JSON read failed (partial write), show waiting state
 if state is None or history is None:
-    time.sleep(0.2)  # Short delay
-    st.rerun()
+    st.info("⏳ Waiting for stable snapshot...")
+    # Don't block - let natural refresh handle it
+
+# ========== DIAGNOSTICS INTENT PROCESSING (BEFORE VERSION-LOCK) ==========
+# CRITICAL: Process ALL pending diagnostics intents BEFORE version-lock skip
+# This ensures button clicks are NEVER dropped by version-lock logic
+diag_store = st.session_state.setdefault("diagnostics", {})
+diag_intents = {k: v for k, v in st.session_state.items() if k.startswith("diag_intent_") and v}
+
+for intent_key in diag_intents:
+    pair_id = intent_key.replace("diag_intent_", "")
+    pair_history = st.session_state.history.get(pair_id, [])
+    
+    # Extract spread data
+    if pair_history and len(pair_history) >= 30:
+        arr = np.array([h.get("spread") or 0 for h in pair_history[-500:]], dtype=np.float64)
+        arr = arr[np.isfinite(arr)]
+        
+        if len(arr) >= 30:
+            adf_result = run_adf_test(arr)
+            hl_result = compute_half_life(arr)
+            
+            diag_store[pair_id] = {
+                "adf": adf_result,
+                "halflife": hl_result,
+                "computed_at": time.time()
+            }
+            st.session_state["diagnostics"] = diag_store
+    
+    # Clear latch (ALWAYS - even if computation failed)
+    st.session_state[intent_key] = False
 
 # VERSION-LOCKED RENDERING: Skip if state unchanged
 if "last_version" not in st.session_state:
     st.session_state.last_version = -1
 
-if state_version is not None and state_version == st.session_state.last_version:
-    # State unchanged - skip expensive rerender, just wait
-    time.sleep(refresh_rate)
-    st.rerun()
+# Check if we should skip rendering (version unchanged)
+skip_render = state_version is not None and state_version == st.session_state.last_version
 
 # Update version tracker
 if state_version is not None:
     st.session_state.last_version = state_version
+
+# If version unchanged, just wait for next refresh cycle
+# BUT never sleep if any pair is ready (instant chart render)
+if skip_render:
+    any_ready = any(s.get("ready", False) for s in state.values()) if state else False
+    if not any_ready:
+        time.sleep(refresh_rate)
+    st.rerun()
+
 
 # Sync history to session state (MERGE with MONOTONICITY enforcement)
 HISTORY_MAX_LEN = 500  # Must match backend cap
@@ -434,13 +483,13 @@ if not state:
     st.warning("⏳ **Waiting for analytics data...**")
     st.caption("Backend is buffering ticks for configured pairs.")
     st.progress(0.0, text="Waiting for first analytics snapshot...")
-    time.sleep(2)
-    st.rerun()
+    time.sleep(refresh_rate)
+    st.rerun()  # Exit here - don't render rest of UI
 
 
 # ========== CONNECTION STATUS ==========
 active_pairs = len(state)
-st.success(f"🟢 **LIVE** • {active_pairs} pair{'s' if active_pairs > 1 else ''} active • Window: {window_size}")
+st.success(f"🟢 **LIVE** • {active_pairs} pair{'s' if active_pairs > 1 else ''} • Window: {window_size} • Refresh: {refresh_rate}s")
 
 
 # ================== HELPER: RENDER PAIR ANALYTICS ==================
@@ -457,15 +506,24 @@ def render_pair_analytics(pair_id: str, snapshot: dict, pair_history: list, z_th
     # Check if this pair has analytics data or is still buffering
     is_ready = snapshot.get("ready", False)
     
-    # ====== PAIR IDENTITY HEADER (ALWAYS RENDERED) ======
+    # STICKY READY: Once a pair is seen as ready, UI never shows buffering again
     if is_ready:
+        st.session_state.pair_ready_once[pair_id] = True
+    display_ready = st.session_state.pair_ready_once.get(pair_id, False)
+    
+    # ====== PAIR IDENTITY HEADER (ALWAYS RENDERED) ======
+    # Use display_ready (sticky) to prevent buffering flicker
+    if display_ready:
+        zscore_display = snapshot.get('zscore') or 0
+        beta_display = snapshot.get('beta') or 0
+        corr_display = snapshot.get('correlation') or 0
         st.markdown(f"""
         <div style="background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%); 
                     padding: 15px 20px; border-radius: 10px; margin-bottom: 15px;
                     border-left: 4px solid #40916c;">
             <h3 style="margin: 0; color: #e94560;">{pair_id.upper()}</h3>
             <p style="margin: 5px 0 0 0; color: #a0a0a0; font-size: 0.9rem;">
-                Z={snapshot.get('zscore', 0):+.2f} | β={snapshot.get('beta', 0):.4f} | ρ={snapshot.get('correlation', 0):.2f}
+                Z={zscore_display:+.2f} | β={beta_display:.4f} | ρ={corr_display:.2f}
             </p>
         </div>
         """, unsafe_allow_html=True)
@@ -483,8 +541,9 @@ def render_pair_analytics(pair_id: str, snapshot: dict, pair_history: list, z_th
         """, unsafe_allow_html=True)
     
     # ====== PAIR QUALITY BADGE ======
-    corr = abs(snapshot.get("correlation", 0))
-    beta = abs(snapshot.get("beta", 0))
+    # Handle None from frozen schema (buffering state)
+    corr = abs(snapshot.get("correlation") or 0)
+    beta = abs(snapshot.get("beta") or 0)
     
     if corr >= 0.7 and beta < 5:
         st.markdown(f"""
@@ -508,11 +567,12 @@ def render_pair_analytics(pair_id: str, snapshot: dict, pair_history: list, z_th
     # ====== KPI METRICS (PAIR-LABELED) - SAFE ACCESS ======
     col1, col2, col3, col4 = st.columns(4)
     
-    beta_val = snapshot.get('beta', 0)
-    zscore_val = snapshot.get('zscore', 0)
-    spread_val = snapshot.get('spread', 0)
-    corr_val = snapshot.get('correlation', 0)
-    ts_val = snapshot.get('timestamp', time.time())
+    # Handle None from frozen schema (buffering state)
+    beta_val = snapshot.get('beta') or 0
+    zscore_val = snapshot.get('zscore') or 0
+    spread_val = snapshot.get('spread') or 0
+    corr_val = snapshot.get('correlation') or 0
+    ts_val = snapshot.get('timestamp') or time.time()
     
     with col1:
         st.metric(f"β ({pair_id})", f"{beta_val:.4f}" if is_ready else "—")
@@ -531,29 +591,99 @@ def render_pair_analytics(pair_id: str, snapshot: dict, pair_history: list, z_th
     if is_ready and abs(zscore_val) >= z_threshold:
         st.error(f"⚠️ **{pair_id.upper()} ALERT**: Z-Score = {zscore_val:.2f} exceeds ±{z_threshold}")
     
-    # ====== PREPARE PAIR-SPECIFIC DATAFRAME ======
-    # CRITICAL: This dataframe is scoped to THIS pair only
-    if is_ready and len(pair_history) > 1:
-        pair_df = pd.DataFrame(pair_history)
-        pair_df["time"] = pd.to_datetime(pair_df["timestamp"], unit="s").dt.strftime("%H:%M:%S")
-    elif is_ready:
-        pair_df = pd.DataFrame([snapshot])
-        pair_df["time"] = [time.strftime('%H:%M:%S', time.localtime(ts_val))]
-    else:
-        # Buffering - create empty placeholder dataframe
-        pair_df = pd.DataFrame({"time": [], "spread": [], "zscore": [], "beta": [], "correlation": []})
+    # ====== STATISTICAL DIAGNOSTICS (ON-DEMAND, PRODUCTION-SAFE) ======
+    st.markdown("**Statistical Diagnostics (On-Demand)**")
     
-    # ====== RENDER STABILITY: Limit window and deduplicate ======
+    # Constants - MUST match analytics.py DIAGNOSTICS_WINDOW
+    MIN_ADF_LEN = 30  # Minimum for valid ADF test
+    MAX_ADF_LEN = 500
+    
+    # Session state keys for latch pattern
+    diag_store = st.session_state.setdefault("diagnostics", {})
+    intent_key = f"diag_intent_{pair_id}"
+    
+    # Helper to extract cleaned spread from history
+    def _clean_spread_from_history(history, max_len=MAX_ADF_LEN):
+        if not history or len(history) == 0:
+            return np.array([], dtype=float)
+        arr = np.array([h.get("spread") or 0 for h in history[-max_len:]], dtype=np.float64)
+        arr = arr[np.isfinite(arr)]
+        return arr
+    
+    spread_arr = _clean_spread_from_history(pair_history)
+    has_enough_data = spread_arr.size >= MIN_ADF_LEN
+    
+    # Readiness and data sufficiency checks
+    diag_col1, diag_col2 = st.columns([1, 3])
+    
+    with diag_col1:
+        btn_label = f"Run Stationarity Check (Last {MIN_ADF_LEN} pts)"
+        btn_disabled = not is_ready or not has_enough_data
+        
+        # Button sets intent latch - will be processed on next render cycle
+        if st.button(btn_label, key=f"diag_btn_{pair_id}", disabled=btn_disabled):
+            st.session_state[intent_key] = True
+            # No st.rerun() - let natural refresh handle it
+    
+    # Display status/results
+    with diag_col2:
+        if not is_ready:
+            st.caption("⏳ Waiting for pair readiness")
+        elif not has_enough_data:
+            st.caption(f"⏳ Need {MIN_ADF_LEN} spread points — currently {spread_arr.size}")
+        elif pair_id in diag_store:
+            pd_diag = diag_store[pair_id]
+            adf = pd_diag.get("adf", {})
+            
+            if not adf.get("valid", False):
+                # Show reason for invalid result
+                reason = adf.get("reason", "Unknown error")
+                st.warning(f"⚠️ {reason}")
+            else:
+                pvalue = adf.get("p_value")
+                is_stat = adf.get("is_stationary")
+                points_used = adf.get("points_used", MIN_ADF_LEN)
+                hl = pd_diag.get("halflife")
+                
+                verdict = "✅ Mean-Reverting" if is_stat else "❌ Not Stationary"
+                pval_str = f"{pvalue:.4f}" if pvalue is not None else "—"
+                hl_str = f"{hl:.1f} ticks" if hl is not None else "N/A"
+                
+                st.caption(f"p-value: {pval_str} | {verdict} | Half-life: {hl_str} | Points: {points_used}")
+        else:
+            st.caption("Click button to run diagnostics")
+    
+    # ====== PREPARE PAIR-SPECIFIC DATAFRAME (CACHED) ======
+    # Cache key: (pair_id, history_length) - avoids expensive rebuild each render
     RENDER_WINDOW = 100  # Max points to display
+    cache_key = f"df_{pair_id}_{len(pair_history)}"
     
-    if len(pair_df) > 0:
-        # Deduplicate timestamps
-        pair_df = pair_df.drop_duplicates(subset=["time"], keep="last")
-        # Limit to last N points for stable rendering
-        pair_df = pair_df.tail(RENDER_WINDOW)
-        # PAIR-ISOLATED INDEX: Reset index and add unique t column
-        pair_df = pair_df.reset_index(drop=True)
-        pair_df["t"] = range(len(pair_df))
+    if cache_key in st.session_state.cached_df:
+        pair_df = st.session_state.cached_df[cache_key]
+    else:
+        # Build DataFrame only when cache miss
+        if is_ready and len(pair_history) > 1:
+            pair_df = pd.DataFrame(pair_history)
+            pair_df["time"] = pd.to_datetime(pair_df["timestamp"], unit="s").dt.strftime("%H:%M:%S")
+        elif is_ready:
+            pair_df = pd.DataFrame([snapshot])
+            pair_df["time"] = [time.strftime('%H:%M:%S', time.localtime(ts_val))]
+        else:
+            pair_df = pd.DataFrame({"time": [], "spread": [], "zscore": [], "beta": [], "correlation": []})
+        
+        # Process: deduplicate and limit
+        if len(pair_df) > 0:
+            pair_df = pair_df.drop_duplicates(subset=["time"], keep="last")
+            pair_df = pair_df.tail(RENDER_WINDOW)
+            pair_df = pair_df.reset_index(drop=True)
+            pair_df["t"] = range(len(pair_df))
+        
+        # Cache it (limit cache size to prevent memory bloat)
+        if len(st.session_state.cached_df) > 50:
+            # Clear old entries
+            st.session_state.cached_df = {}
+        st.session_state.cached_df[cache_key] = pair_df
+    
     
     # ====== ROW 1: SPREAD & Z-SCORE (ALWAYS RENDER) ======
     row1_col1, row1_col2 = st.columns(2)
@@ -563,7 +693,7 @@ def render_pair_analytics(pair_id: str, snapshot: dict, pair_history: list, z_th
         if len(pair_df) >= 1:
             fig_spread = go.Figure()
             fig_spread.add_trace(go.Scatter(
-                x=pair_df["time"], 
+                x=pair_df["t"], 
                 y=pair_df["spread"],
                 mode="lines+markers",
                 name=f"Spread ({pair_id})",
@@ -572,7 +702,7 @@ def render_pair_analytics(pair_id: str, snapshot: dict, pair_history: list, z_th
             ))
             fig_spread.update_layout(
                 title=f"📉 Spread — {pair_id.upper()}",
-                xaxis_title="Time",
+                xaxis_title="Tick",
                 yaxis_title="Spread",
                 height=250,
                 template="plotly_dark",
@@ -582,14 +712,23 @@ def render_pair_analytics(pair_id: str, snapshot: dict, pair_history: list, z_th
             )
             st.plotly_chart(fig_spread, use_container_width=True, key=f"spread_{pair_id}")
         else:
-            st.info(f"⏳ Waiting for spread data... ({pair_id})")
+            # PLACEHOLDER CHART (keeps widget tree stable)
+            fig_spread = go.Figure()
+            fig_spread.update_layout(
+                title=f"📉 Spread — {pair_id.upper()} (buffering...)",
+                height=250, template="plotly_dark",
+                margin=dict(l=10, r=10, t=40, b=40),
+                uirevision=f"spread_{pair_id}",
+                annotations=[dict(text="Waiting for data...", showarrow=False, font=dict(size=14, color="gray"))]
+            )
+            st.plotly_chart(fig_spread, use_container_width=True, key=f"spread_{pair_id}")
     
     with row1_col2:
         # Z-SCORE CHART
         if len(pair_df) >= 1:
             fig_z = go.Figure()
             fig_z.add_trace(go.Scatter(
-                x=pair_df["time"], 
+                x=pair_df["t"], 
                 y=pair_df["zscore"],
                 mode="lines+markers",
                 name=f"Z-Score ({pair_id})",
@@ -603,7 +742,7 @@ def render_pair_analytics(pair_id: str, snapshot: dict, pair_history: list, z_th
             fig_z.add_hline(y=0, line_dash="dot", line_color="gray")
             fig_z.update_layout(
                 title=f"📊 Z-Score — {pair_id.upper()}",
-                xaxis_title="Time",
+                xaxis_title="Tick",
                 yaxis_title="Z-Score (σ)",
                 height=250,
                 template="plotly_dark",
@@ -613,7 +752,18 @@ def render_pair_analytics(pair_id: str, snapshot: dict, pair_history: list, z_th
             )
             st.plotly_chart(fig_z, use_container_width=True, key=f"zscore_{pair_id}")
         else:
-            st.info(f"⏳ Waiting for z-score data... ({pair_id})")
+            fig_z = go.Figure()
+            fig_z.add_hline(y=z_threshold, line_dash="dash", line_color="#ffd60a", line_width=2)
+            fig_z.add_hline(y=-z_threshold, line_dash="dash", line_color="#ffd60a", line_width=2)
+            fig_z.add_hline(y=0, line_dash="dot", line_color="gray")
+            fig_z.update_layout(
+                title=f"📊 Z-Score — {pair_id.upper()} (buffering...)",
+                height=250, template="plotly_dark",
+                margin=dict(l=10, r=10, t=40, b=40),
+                uirevision=f"zscore_{pair_id}",
+                annotations=[dict(text="Waiting for data...", showarrow=False, font=dict(size=14, color="gray"))]
+            )
+            st.plotly_chart(fig_z, use_container_width=True, key=f"zscore_{pair_id}")
     
     # ====== ROW 2: BETA & CORRELATION (ALWAYS RENDER) ======
     row2_col1, row2_col2 = st.columns(2)
@@ -623,7 +773,7 @@ def render_pair_analytics(pair_id: str, snapshot: dict, pair_history: list, z_th
         if len(pair_df) >= 1:
             fig_beta = go.Figure()
             fig_beta.add_trace(go.Scatter(
-                x=pair_df["time"], 
+                x=pair_df["t"], 
                 y=pair_df["beta"],
                 mode="lines+markers",
                 name=f"Beta ({pair_id})",
@@ -634,7 +784,7 @@ def render_pair_analytics(pair_id: str, snapshot: dict, pair_history: list, z_th
                               annotation_text="β=1")
             fig_beta.update_layout(
                 title=f"📈 Beta (β) — {pair_id.upper()}",
-                xaxis_title="Time",
+                xaxis_title="Tick",
                 yaxis_title="Hedge Ratio",
                 height=250,
                 template="plotly_dark",
@@ -644,14 +794,23 @@ def render_pair_analytics(pair_id: str, snapshot: dict, pair_history: list, z_th
             )
             st.plotly_chart(fig_beta, use_container_width=True, key=f"beta_{pair_id}")
         else:
-            st.info(f"⏳ Waiting for beta data... ({pair_id})")
+            fig_beta = go.Figure()
+            fig_beta.add_hline(y=1.0, line_dash="dash", line_color="#ffd60a", line_width=1)
+            fig_beta.update_layout(
+                title=f"📈 Beta (β) — {pair_id.upper()} (buffering...)",
+                height=250, template="plotly_dark",
+                margin=dict(l=10, r=10, t=40, b=40),
+                uirevision=f"beta_{pair_id}",
+                annotations=[dict(text="Waiting for data...", showarrow=False, font=dict(size=14, color="gray"))]
+            )
+            st.plotly_chart(fig_beta, use_container_width=True, key=f"beta_{pair_id}")
     
     with row2_col2:
         # CORRELATION CHART
         if len(pair_df) >= 1:
             fig_corr = go.Figure()
             fig_corr.add_trace(go.Scatter(
-                x=pair_df["time"], 
+                x=pair_df["t"], 
                 y=pair_df["correlation"],
                 mode="lines+markers",
                 name=f"Correlation ({pair_id})",
@@ -664,7 +823,7 @@ def render_pair_analytics(pair_id: str, snapshot: dict, pair_history: list, z_th
             fig_corr.add_hline(y=0, line_dash="dot", line_color="gray")
             fig_corr.update_layout(
                 title=f"🔗 Correlation (ρ) — {pair_id.upper()}",
-                xaxis_title="Time",
+                xaxis_title="Tick",
                 yaxis_title="Pearson ρ",
                 height=250,
                 template="plotly_dark",
@@ -675,12 +834,23 @@ def render_pair_analytics(pair_id: str, snapshot: dict, pair_history: list, z_th
             )
             st.plotly_chart(fig_corr, use_container_width=True, key=f"corr_{pair_id}")
         else:
-            st.info(f"⏳ Waiting for correlation data... ({pair_id})")
+            fig_corr = go.Figure()
+            fig_corr.add_hline(y=0.7, line_dash="dash", line_color="#40916c", line_width=1)
+            fig_corr.add_hline(y=-0.7, line_dash="dash", line_color="#40916c", line_width=1)
+            fig_corr.add_hline(y=0, line_dash="dot", line_color="gray")
+            fig_corr.update_layout(
+                title=f"🔗 Correlation (ρ) — {pair_id.upper()} (buffering...)",
+                height=250, template="plotly_dark",
+                margin=dict(l=10, r=10, t=40, b=40),
+                yaxis=dict(range=[-1.1, 1.1]),
+                uirevision=f"corr_{pair_id}",
+                annotations=[dict(text="Waiting for data...", showarrow=False, font=dict(size=14, color="gray"))]
+            )
+            st.plotly_chart(fig_corr, use_container_width=True, key=f"corr_{pair_id}")
     
     # ====== PAIR-SPECIFIC FOOTER ======
     last_time = time.strftime('%H:%M:%S', time.localtime(ts_val)) if is_ready else "—"
     st.caption(f"📍 {pair_id.upper()} | History: {len(pair_history)} pts | Last: {last_time}")
-    st.markdown("---")
 
 
 # ================== TABBED VIEW PER PAIR ==================
@@ -695,7 +865,6 @@ if active_pairs == 0:
     # Still render a placeholder container
     with st.container():
         st.warning("No analytics data available yet")
-        st.empty()  # Placeholder for consistency
 else:
     # ALWAYS use tabs (even for single pair) - stable structure
     tabs = st.tabs(sorted_pair_ids if active_pairs > 0 else ["Waiting..."])
@@ -724,7 +893,6 @@ else:
 
 
 # ================== GLOBAL: EXPORTS & LOGS (OUTSIDE PAIR LOOP) ==================
-st.markdown("---")
 st.subheader("📤 Exports & Logs")
 
 # Check if all pairs are ready
@@ -737,20 +905,20 @@ exp_col1, exp_col2, exp_col3 = st.columns(3)
 with exp_col1:
     # Combined analytics state download
     if state:
+        json_data = json.dumps(state, indent=2)
         st.download_button(
             "📊 Download State (JSON)",
-            data=json.dumps(state, indent=2),
-            file_name=f"analytics_state_{int(time.time())}.json",
+            data=json_data,
+            file_name="analytics_state.json",
             mime="application/json",
             use_container_width=True,
-            key="download_state"
+            key="global_download_state"
         )
 
 with exp_col2:
     # Combined history download
     all_histories = st.session_state.history
     if any(len(h) > 0 for h in all_histories.values()):
-        # Build combined dataframe
         rows = []
         for pair_id, hist in all_histories.items():
             for h in hist:
@@ -762,60 +930,60 @@ with exp_col2:
             st.download_button(
                 "📈 Download History (CSV)",
                 data=csv_data,
-                file_name=f"analytics_history_{int(time.time())}.csv",
+                file_name="analytics_history.csv",
                 mime="text/csv",
                 use_container_width=True,
-                key="download_history"
+                key="global_download_history"
             )
 
 with exp_col3:
-    # Count total history points
+    # Count total history points - GLOBAL ONLY, keyed to prevent duplicates
     total_points = sum(len(h) for h in all_histories.values())
-    st.metric("Total History", f"{total_points} pts")
+    st.metric("Total History", f"{total_points} pts", help="Combined across all pairs")
 
-# ================== GLOBAL: RECENT ANALYTICS LOG ==================
-# Combine all histories for log table
-all_recent = []
-for pair_id, hist in st.session_state.history.items():
-    for h in hist[-10:]:  # Last 10 per pair
-        all_recent.append({
-            "pair": pair_id.upper(),
-            "beta": h.get("beta", 0),
-            "zscore": h.get("zscore", 0),
-            "spread": h.get("spread", 0),
-            "correlation": h.get("correlation", 0),
-            "timestamp": h.get("timestamp", 0)
-        })
+# ================== GLOBAL: RECENT ANALYTICS LOG (SCROLLABLE, STABLE) ==================
+# Wrap in single column to create stable structure (prevents duplicates on reruns)
+# The dataframe and info widgets inside have keys to ensure single rendering
+_log_col, = st.columns([1])
+with _log_col:
+    with st.expander("📋 Recent Analytics Log (All Pairs)", expanded=False):
+        # Combine all histories for log table - cap at 100, global not per-pair
+        LOG_MAX_LEN = 100
+        all_recent = []
+        for pair_id, hist in st.session_state.history.items():
+            for h in hist:
+                all_recent.append({
+                    "ts": h.get("timestamp", 0),
+                    "pair": pair_id.upper(),
+                    "beta": h.get("beta") or 0,
+                    "zscore": h.get("zscore") or 0,
+                    "spread": h.get("spread") or 0,
+                    "correlation": h.get("correlation") or 0
+                })
 
-if len(all_recent) > 0:
-    st.markdown("### 📋 Recent Analytics Log (All Pairs)")
-    
-    log_df = pd.DataFrame(all_recent)
-    log_df["time"] = pd.to_datetime(log_df["timestamp"], unit="s").dt.strftime("%H:%M:%S")
-    log_df = log_df.sort_values("timestamp", ascending=False).head(25)
-    log_df = log_df[["time", "pair", "beta", "zscore", "spread", "correlation"]]
-    log_df.columns = ["Time", "Pair", "Beta", "Z-Score", "Spread", "Correlation"]
-    
-    def highlight_zscore(val):
-        if abs(val) >= z_threshold:
-            return 'background-color: rgba(233, 69, 96, 0.3)'
-        return ''
-    
-    styled_df = log_df.style.format({
-        "Beta": "{:.4f}",
-        "Z-Score": "{:.2f}",
-        "Spread": "{:.6f}",
-        "Correlation": "{:.2%}"
-    }).map(highlight_zscore, subset=["Z-Score"])
-    
-    st.dataframe(styled_df, use_container_width=True)
+        if len(all_recent) > 0:
+            log_df = pd.DataFrame(all_recent)
+            log_df["time"] = pd.to_datetime(log_df["ts"], unit="s").dt.strftime("%H:%M:%S")
+            log_df = log_df.sort_values("ts", ascending=False).head(LOG_MAX_LEN)
+            log_df = log_df[["time", "pair", "beta", "zscore", "spread", "correlation"]]
+            log_df.columns = ["Time", "Pair", "Beta", "Z-Score", "Spread", "Correlation"]
+            
+            # Fixed height = no layout jump, scrollable
+            st.dataframe(
+                log_df,
+                height=420,
+                use_container_width=True,
+                hide_index=True,
+                key="analytics_log_dataframe"
+            )
+        else:
+            st.info("No analytics logs yet.")
 
 
 # ================== FOOTER ==========
 st.markdown("---")
 st.caption(f"🔒 Read-only dashboard | {len(state)} pairs active | Window: {window_size} | Refresh: {refresh_rate}s")
 st.caption("ℹ️ β and ρ are rolling tick-aligned estimates — rapid variation is expected under microstructure noise.")
-
 
 # ================== AUTO REFRESH ==========
 time.sleep(refresh_rate)

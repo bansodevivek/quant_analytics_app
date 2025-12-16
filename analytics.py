@@ -14,9 +14,134 @@ This module must never:
 
 import time
 import numpy as np
-from typing import Dict, Optional
+from typing import Dict, Optional, Union
 
 from utils import TickBuffer
+
+
+# ============================================================
+# PURE HELPER FUNCTIONS (no I/O, no side effects)
+# ============================================================
+
+# DIAGNOSTICS_WINDOW: Fixed window for local stationarity check
+# 30 points minimum for statistically valid ADF test
+DIAGNOSTICS_WINDOW = 30
+
+
+def run_adf_test(spread: np.ndarray) -> Dict:
+    """
+    Run Augmented Dickey-Fuller test for LOCAL stationarity.
+    
+    Uses exactly DIAGNOSTICS_WINDOW points (last 30) for responsive,
+    trader-relevant stationarity detection.
+    
+    ALWAYS returns a dict (never None) with full contract:
+        {
+            "valid": bool,
+            "points_used": int,
+            "reason": str | None,
+            "p_value": float | None,
+            "is_stationary": bool | None,
+            "critical_5pct": float | None
+        }
+    """
+    # Base response structure
+    result = {
+        "valid": False,
+        "points_used": 0,
+        "reason": None,
+        "p_value": None,
+        "is_stationary": None,
+        "critical_5pct": None
+    }
+    
+    try:
+        if spread is None:
+            result["reason"] = "No spread data provided"
+            return result
+        
+        # Clean NaN values
+        spread = spread[~np.isnan(spread)]
+        spread = spread[np.isfinite(spread)]
+        
+        result["points_used"] = len(spread)
+        
+        if len(spread) < DIAGNOSTICS_WINDOW:
+            result["reason"] = f"Insufficient data: {len(spread)}/{DIAGNOSTICS_WINDOW} points"
+            return result
+        
+        # ENFORCE: Use exactly last DIAGNOSTICS_WINDOW points
+        spread = spread[-DIAGNOSTICS_WINDOW:]
+        result["points_used"] = DIAGNOSTICS_WINDOW
+        
+        from statsmodels.tsa.stattools import adfuller
+        
+        adf_result = adfuller(spread, autolag='AIC')
+        
+        p_value = float(adf_result[1])
+        critical_5pct = float(adf_result[4]['5%'])
+        adf_stat = float(adf_result[0])
+        
+        result["valid"] = True
+        result["reason"] = None
+        result["p_value"] = p_value
+        result["is_stationary"] = adf_stat < critical_5pct
+        result["critical_5pct"] = critical_5pct
+        
+        return result
+        
+    except Exception as e:
+        result["reason"] = f"ADF computation error: {str(e)}"
+        return result
+
+
+def compute_half_life(spread: np.ndarray) -> Optional[float]:
+    """
+    Compute mean-reversion half-life using AR(1) model.
+    
+    Uses exactly DIAGNOSTICS_WINDOW points for local estimation.
+    
+    Returns:
+        Half-life in ticks, or None if unstable/invalid.
+    """
+    try:
+        if spread is None:
+            return None
+        
+        # Clean NaN values
+        spread = spread[~np.isnan(spread)]
+        spread = spread[np.isfinite(spread)]
+        
+        if len(spread) < DIAGNOSTICS_WINDOW:
+            return None
+        
+        # ENFORCE: Use exactly last DIAGNOSTICS_WINDOW points
+        spread = spread[-DIAGNOSTICS_WINDOW:]
+        
+        # AR(1) regression: spread[t] = phi * spread[t-1] + epsilon
+        lagged = spread[:-1]
+        delta = spread[1:] - lagged
+        
+        if np.std(lagged) == 0:
+            return None
+        
+        # Fit: delta = phi * lagged + intercept
+        phi = np.polyfit(lagged, delta, 1)[0]
+        
+        # Guard: phi must indicate mean-reversion (-1 < phi < 0)
+        if phi >= 0 or phi <= -1:
+            return None
+        
+        # Half-life = -ln(2) / ln(1 + phi)
+        half_life = -np.log(2) / np.log(1 + phi)
+        
+        if not np.isfinite(half_life) or half_life <= 0:
+            return None
+        
+        return float(half_life)
+    except Exception:
+        return None
+
 
 
 class AnalyticsEngine:
