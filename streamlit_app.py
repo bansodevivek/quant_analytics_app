@@ -1,20 +1,22 @@
 """
 Streamlit dashboard for real-time quantitative analytics.
 
+Multi-Pair Support:
+- Base Symbol: Single symbol (X in regression)
+- Compare Symbols: Multiple symbols (Y in regression)
+- Each pair gets isolated analytics, history, and charts
+- Tabbed view: one tab per pair
+
 UX Design:
 - Start button: locks config, starts backend, shows charts
 - Stop button: stops backend, hides charts, unlocks config
 - Single running flag controls all visibility
-- No Apply/Confirm - just Start/Stop
 """
 
 import time
-import os
-import csv
 import json
 import streamlit as st
 import plotly.graph_objects as go
-import numpy as np
 import pandas as pd
 from pathlib import Path
 
@@ -29,12 +31,10 @@ st.set_page_config(
 # ---------------- Session State Initialization ----------------
 if "running" not in st.session_state:
     st.session_state.running = False
-if "pair" not in st.session_state:
-    st.session_state.pair = None
+if "pairs" not in st.session_state:
+    st.session_state.pairs = []
 if "history" not in st.session_state:
-    st.session_state.history = []
-if "logs" not in st.session_state:
-    st.session_state.logs = []
+    st.session_state.history = {}  # Dict of pair_id → list of snapshots
 
 
 # ---------------- Constants ----------------
@@ -42,8 +42,10 @@ DATA_DIR = Path("data")
 DATA_DIR.mkdir(exist_ok=True)
 
 CONTROL_PATH = DATA_DIR / "control.json"
-STATE_PATH = DATA_DIR / "analytics_state.csv"
+STATE_PATH = DATA_DIR / "analytics_state.json"
 HISTORY_PATH = DATA_DIR / "analytics_history.json"
+
+MAX_PAIRS = 10
 
 AVAILABLE_SYMBOLS = [
     "btcusdt", "ethusdt", "bnbusdt", "xrpusdt", "adausdt",
@@ -92,9 +94,10 @@ with st.sidebar:
     
     is_running = st.session_state.running
     
-    # Symbol Selection (disabled when running)
+    # ========== SYMBOL SELECTION ==========
     st.subheader("📊 Symbol Selection")
     
+    # Base Symbol (X) - Single select
     base_symbol = st.selectbox(
         "Base Symbol (X)",
         options=AVAILABLE_SYMBOLS,
@@ -103,33 +106,59 @@ with st.sidebar:
         help="Independent variable in regression"
     )
     
-    quote_symbol = st.selectbox(
-        "Quote Symbol (Y)",
-        options=AVAILABLE_SYMBOLS,
-        index=1,
+    # Compare Symbols (Y) - Multi-select
+    available_compare = [s for s in AVAILABLE_SYMBOLS if s != base_symbol]
+    compare_symbols = st.multiselect(
+        "Compare Symbols (Y)",
+        options=available_compare,
+        default=[available_compare[0]] if available_compare else [],
         disabled=is_running,
-        help="Dependent variable in regression"
+        help="Dependent variables - one pair per symbol"
     )
     
+    # Custom symbols
     custom_base = st.text_input(
         "Custom Base Symbol",
         placeholder="e.g., arbusdt",
-        disabled=is_running
+        disabled=is_running,
+        help="Single symbol only"
     )
     
-    custom_quote = st.text_input(
-        "Custom Quote Symbol",
-        placeholder="e.g., opusdt",
-        disabled=is_running
+    custom_compare = st.text_input(
+        "Custom Compare Symbols",
+        placeholder="e.g., opusdt, wldusdt",
+        disabled=is_running,
+        help="Comma-separated symbols"
     )
     
-    # Use custom if provided
-    final_base = custom_base.lower().strip() if custom_base else base_symbol
-    final_quote = custom_quote.lower().strip() if custom_quote else quote_symbol
+    # Clean and validate symbols
+    def clean_symbol(s):
+        s = s.lower().strip()
+        if not s or not s.isalnum():
+            return None
+        return s
+    
+    # Process base symbol - use custom if valid, else use dropdown
+    cleaned_custom_base = clean_symbol(custom_base) if custom_base else None
+    final_base = cleaned_custom_base if cleaned_custom_base else base_symbol
+    
+    # Process compare symbols (combine dropdown + custom)
+    all_compare = list(compare_symbols)
+    if custom_compare:
+        custom_list = [clean_symbol(s) for s in custom_compare.split(",")]
+        custom_list = [s for s in custom_list if s and s != final_base]
+        all_compare.extend(custom_list)
+    
+    # Remove duplicates and base symbol
+    all_compare = list(dict.fromkeys(all_compare))  # Preserve order, remove dupes
+    all_compare = [s for s in all_compare if s and s != final_base]
+    
+    # Generate pairs (ensure no None values)
+    pairs = [(quote.lower(), final_base.lower()) for quote in all_compare if quote]
     
     st.divider()
     
-    # Analytics Parameters
+    # ========== PARAMETERS ==========
     st.subheader("📈 Parameters")
     
     window_size = st.slider(
@@ -158,6 +187,30 @@ with st.sidebar:
     
     st.divider()
     
+    # ========== VALIDATION (FAIL-FAST) ==========
+    validation_errors = []
+    
+    # 1. Base symbol must exist (enforced by selectbox but check anyway)
+    if not final_base:
+        validation_errors.append("You must select exactly ONE base symbol")
+    
+    # 2. At least one compare symbol
+    if len(all_compare) == 0:
+        validation_errors.append("Select at least one compare symbol")
+    
+    # 3. Base symbol not in compare list (should be filtered but double-check)
+    if final_base in all_compare:
+        validation_errors.append("Base symbol cannot appear in compare symbols")
+    
+    # 4. Max pairs limit
+    if len(pairs) > MAX_PAIRS:
+        validation_errors.append(f"Maximum {MAX_PAIRS} compare symbols allowed (got {len(pairs)})")
+    
+    # 5. Show all errors
+    if validation_errors:
+        for error in validation_errors:
+            st.error(f"❌ {error}")
+    
     # ========== START / STOP BUTTONS ==========
     st.subheader("🎮 Control")
     
@@ -166,7 +219,7 @@ with st.sidebar:
     with col1:
         start_clicked = st.button(
             "▶️ Start",
-            disabled=is_running,
+            disabled=is_running or len(validation_errors) > 0,
             use_container_width=True,
             type="primary"
         )
@@ -179,40 +232,29 @@ with st.sidebar:
         )
     
     # ========== START LOGIC ==========
-    if start_clicked:
-        # -------- SYMBOL VALIDATION (STRICT) --------
-        validation_error = None
+    if start_clicked and len(validation_errors) == 0:
+        # Get unique symbols for ingestion
+        unique_symbols = list(set([final_base] + [p[0] for p in pairs]))
         
-        if final_base == final_quote:
-            validation_error = "❌ Base and Quote symbols must be different!"
-        elif final_base not in AVAILABLE_SYMBOLS and not custom_base:
-            validation_error = f"❌ No data stream available for {final_base.upper()}"
-        elif final_quote not in AVAILABLE_SYMBOLS and not custom_quote:
-            validation_error = f"❌ No data stream available for {final_quote.upper()}"
-        
-        if validation_error:
-            st.error(validation_error)
-            st.stop()
-        
-        # -------- HARD RESET UI STATE --------
+        # Reset state
         st.session_state.running = True
-        st.session_state.pair = f"{final_quote.upper()}/{final_base.upper()}"
-        st.session_state.history = []
-        st.session_state.logs = []
+        st.session_state.pairs = pairs
+        st.session_state.history = {f"{p[0]}/{p[1]}": [] for p in pairs}
         
         # Clear old state files
         if STATE_PATH.exists():
             STATE_PATH.unlink()
-        if HISTORY_PATH.exists():
-            with open(HISTORY_PATH, "w") as f:
-                json.dump([], f)
+        with open(HISTORY_PATH, "w") as f:
+            json.dump({}, f)
         
-        # -------- WRITE CONTROL SIGNAL --------
+        # Write control signal
         with open(CONTROL_PATH, "w") as f:
             json.dump({
                 "action": "START",
-                "symbol_x": final_base,
-                "symbol_y": final_quote,
+                "base": final_base,
+                "compare": all_compare,
+                "pairs": pairs,
+                "unique_symbols": unique_symbols,
                 "window_size": window_size,
                 "timestamp": time.time()
             }, f)
@@ -223,7 +265,6 @@ with st.sidebar:
     if stop_clicked:
         st.session_state.running = False
         
-        # Write stop signal for backend
         with open(CONTROL_PATH, "w") as f:
             json.dump({
                 "action": "STOP",
@@ -232,22 +273,31 @@ with st.sidebar:
         
         st.rerun()
     
-    # Status indicator
+    # ========== STATUS INDICATOR ==========
     st.divider()
     if is_running:
+        pair_count = len(st.session_state.pairs)
         st.markdown(f"""
         <div class="status-running">
         🟢 <strong>RUNNING</strong><br>
-        <small>{st.session_state.pair}</small>
+        <small>{pair_count} pair{'s' if pair_count > 1 else ''} active</small>
         </div>
         """, unsafe_allow_html=True)
     else:
         st.markdown("""
         <div class="status-stopped">
         ⚫ <strong>STOPPED</strong><br>
-        <small>Press Start to begin</small>
+        <small>Configure and press Start</small>
         </div>
         """, unsafe_allow_html=True)
+    
+    # Show configured pairs
+    if pairs and not is_running:
+        st.caption(f"**Configured pairs ({len(pairs)}):**")
+        for p in pairs[:5]:
+            st.caption(f"  • {p[0].upper()}/{p[1].upper()}")
+        if len(pairs) > 5:
+            st.caption(f"  ... and {len(pairs) - 5} more")
 
 
 # ================== MAIN CONTENT ==================
@@ -256,7 +306,7 @@ with st.sidebar:
 st.markdown("""
 <div class="main-header">
     <h1 style="margin:0; color: #e94560;">Quant Analytics Dashboard</h1>
-    <p style="margin:5px 0 0 0; color: #a0a0a0;">Real-Time Statistical Arbitrage Monitor • Binance Futures</p>
+    <p style="margin:5px 0 0 0; color: #a0a0a0;">Real-Time Statistical Arbitrage Monitor • Multi-Pair Support</p>
 </div>
 """, unsafe_allow_html=True)
 
@@ -264,297 +314,485 @@ st.markdown("""
 # ========== GATE: Show content only when running ==========
 if not st.session_state.running:
     st.info("👈 **Configure symbols and press Start** to begin live analytics.")
-    st.caption("Select your trading pair, set parameters, then click the Start button in the sidebar.")
+    st.caption("Select a base symbol and one or more compare symbols, then click Start.")
+    
+    # Show pair preview
+    if pairs:
+        st.markdown("### 📋 Pair Preview")
+        cols = st.columns(min(len(pairs), 4))
+        for i, (quote, base) in enumerate(pairs[:4]):
+            with cols[i]:
+                st.metric(f"Pair {i+1}", f"{quote.upper()}/{base.upper()}")
+    
     st.stop()
 
 
-# ========== RUNNING STATE - Load and Display Data ==========
+# ================== LOAD STATE ==========
 
 def load_state():
-    """Load latest analytics snapshot."""
+    """
+    Load multi-pair analytics state.
+    Returns (version, pairs_dict) or (None, {}) if file missing/invalid.
+    """
     if not STATE_PATH.exists():
-        return None
+        return (None, {})
     try:
-        with open(STATE_PATH, newline="") as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                return {
-                    "timestamp": float(row["timestamp"]),
-                    "pair": row["pair"],
-                    "alpha": float(row["alpha"]),
-                    "beta": float(row["beta"]),
-                    "spread": float(row["spread"]),
-                    "zscore": float(row["zscore"]),
-                    "correlation": float(row["correlation"]),
-                }
+        with open(STATE_PATH) as f:
+            content = f.read()
+            if not content.strip():
+                return (None, {})  # Empty file
+            data = json.loads(content)
+            
+            # Handle versioned format
+            if isinstance(data, dict) and "version" in data:
+                return (data.get("version"), data.get("pairs", {}))
+            else:
+                # Legacy format (just pairs dict)
+                return (0, data)
+    except json.JSONDecodeError:
+        # Partial write in progress - skip this frame
+        return (None, None)  # Signal to skip
+    except (FileNotFoundError, PermissionError):
+        return (None, {})
     except Exception:
-        return None
-    return None
+        return (None, {})
 
 
 def load_history():
-    """Load history from backend."""
+    """
+    Load per-pair history.
+    Returns {} if file missing or None if read fails (skip frame).
+    """
     if not HISTORY_PATH.exists():
-        return []
+        return {}
     try:
         with open(HISTORY_PATH) as f:
-            return json.load(f)
+            content = f.read()
+            if not content.strip():
+                return {}
+            return json.loads(content)
+    except json.JSONDecodeError:
+        return None  # Skip frame
     except Exception:
-        return []
+        return {}
+
 
 
 # Load current state
-state = load_state()
+# Load versioned state
+state_version, state = load_state()
 history = load_history()
 
-# Sync history to session state
-if history:
-    st.session_state.history = history
+# FRAME SKIP: If JSON read failed (partial write), skip this render
+if state is None or history is None:
+    time.sleep(0.2)  # Short delay
+    st.rerun()
 
-# ========== STATE-AWARE STATUS MESSAGING ==========
-requested_pair = f"{final_quote.upper()}/{final_base.upper()}"
+# VERSION-LOCKED RENDERING: Skip if state unchanged
+if "last_version" not in st.session_state:
+    st.session_state.last_version = -1
 
-# Case 1: No analytics data yet (buffering phase)
-if state is None:
-    st.markdown("""
-    <div style="background: linear-gradient(90deg, #1a5276, #2980b9); padding: 15px; border-radius: 10px; margin: 10px 0;">
-    ⏳ <strong>BUFFERING</strong> — Collecting ticks for {pair}<br>
-    <small>Window needs to fill before analytics can compute. This may take 30-60 seconds.</small>
-    </div>
-    """.format(pair=requested_pair), unsafe_allow_html=True)
-    
-    # Show a progress indicator
+if state_version is not None and state_version == st.session_state.last_version:
+    # State unchanged - skip expensive rerender, just wait
+    time.sleep(refresh_rate)
+    st.rerun()
+
+# Update version tracker
+if state_version is not None:
+    st.session_state.last_version = state_version
+
+# Sync history to session state (MERGE with MONOTONICITY enforcement)
+HISTORY_MAX_LEN = 500  # Must match backend cap
+
+if isinstance(history, dict):
+    for pair_id, pair_history in history.items():
+        if pair_id not in st.session_state.history:
+            st.session_state.history[pair_id] = []
+        
+        # Get last timestamp in session history (monotonicity anchor)
+        last_ts = 0
+        if st.session_state.history[pair_id]:
+            last_ts = st.session_state.history[pair_id][-1].get("timestamp", 0)
+        
+        # MONOTONICITY: Only add entries with strictly newer timestamps
+        for entry in pair_history:
+            entry_ts = entry.get("timestamp", 0)
+            if entry_ts > last_ts:
+                st.session_state.history[pair_id].append(entry)
+                last_ts = entry_ts  # Update anchor
+        
+        # CAP: Enforce max length to prevent unbounded growth
+        if len(st.session_state.history[pair_id]) > HISTORY_MAX_LEN:
+            st.session_state.history[pair_id] = st.session_state.history[pair_id][-HISTORY_MAX_LEN:]
+else:
+    # Old format was list - ignore it
+    history = {}
+
+
+# ========== WAITING FOR DATA ==========
+if not state:
+    st.warning("⏳ **Waiting for analytics data...**")
+    st.caption("Backend is buffering ticks for configured pairs.")
     st.progress(0.0, text="Waiting for first analytics snapshot...")
     time.sleep(2)
     st.rerun()
 
-# Case 2: Backend pair doesn't match requested pair (transitioning)
-if state["pair"].lower().replace("/", "") != f"{final_quote}{final_base}".lower():
-    st.markdown("""
-    <div style="background: linear-gradient(90deg, #b8860b, #daa520); padding: 15px; border-radius: 10px; margin: 10px 0;">
-    🔄 <strong>TRANSITIONING</strong> — Backend switching from {old} to {new}<br>
-    <small>Ingestion restarting for new symbols. Please wait...</small>
-    </div>
-    """.format(old=state["pair"], new=requested_pair), unsafe_allow_html=True)
-    time.sleep(1)
-    st.rerun()
-
 
 # ========== CONNECTION STATUS ==========
-col_status, col_time = st.columns([4, 1])
-with col_status:
-    st.success(f"🟢 **LIVE** • Pair: `{state['pair']}` • Window: `{window_size}` • History: `{len(st.session_state.history)} pts`")
-with col_time:
-    st.caption(f"Updated: {time.strftime('%H:%M:%S', time.localtime(state['timestamp']))}")
+active_pairs = len(state)
+st.success(f"🟢 **LIVE** • {active_pairs} pair{'s' if active_pairs > 1 else ''} active • Window: {window_size}")
 
 
-# ========== PAIR QUALITY BADGE ==========
-corr = abs(state["correlation"])
-beta = abs(state["beta"])
+# ================== HELPER: RENDER PAIR ANALYTICS ==================
+def render_pair_analytics(pair_id: str, snapshot: dict, pair_history: list, z_threshold: float, window_size: int):
+    """
+    Render analytics for a single pair.
+    
+    CRITICAL: 
+    - Every visual element explicitly identifies its pair.
+    - ALWAYS renders the same structure (stable widget tree).
+    - Uses placeholders when data not ready.
+    """
+    
+    # Check if this pair has analytics data or is still buffering
+    is_ready = snapshot.get("ready", False)
+    
+    # ====== PAIR IDENTITY HEADER (ALWAYS RENDERED) ======
+    if is_ready:
+        st.markdown(f"""
+        <div style="background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%); 
+                    padding: 15px 20px; border-radius: 10px; margin-bottom: 15px;
+                    border-left: 4px solid #40916c;">
+            <h3 style="margin: 0; color: #e94560;">{pair_id.upper()}</h3>
+            <p style="margin: 5px 0 0 0; color: #a0a0a0; font-size: 0.9rem;">
+                Z={snapshot.get('zscore', 0):+.2f} | β={snapshot.get('beta', 0):.4f} | ρ={snapshot.get('correlation', 0):.2f}
+            </p>
+        </div>
+        """, unsafe_allow_html=True)
+    else:
+        # Buffering state - show placeholder header
+        st.markdown(f"""
+        <div style="background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%); 
+                    padding: 15px 20px; border-radius: 10px; margin-bottom: 15px;
+                    border-left: 4px solid #ffd60a;">
+            <h3 style="margin: 0; color: #ffd60a;">⏳ {pair_id.upper()}</h3>
+            <p style="margin: 5px 0 0 0; color: #a0a0a0; font-size: 0.9rem;">
+                Buffering data...
+            </p>
+        </div>
+        """, unsafe_allow_html=True)
+    
+    # ====== PAIR QUALITY BADGE ======
+    corr = abs(snapshot.get("correlation", 0))
+    beta = abs(snapshot.get("beta", 0))
+    
+    if corr >= 0.7 and beta < 5:
+        st.markdown(f"""
+        <div style="background: linear-gradient(90deg, #2d6a4f, #40916c); padding: 8px 12px; border-radius: 6px; margin: 8px 0; display: inline-block;">
+        🟢 <strong>VALID PAIR</strong> — {pair_id.upper()}
+        </div>
+        """, unsafe_allow_html=True)
+    elif corr >= 0.5:
+        st.markdown(f"""
+        <div style="background: linear-gradient(90deg, #b8860b, #daa520); padding: 8px 12px; border-radius: 6px; margin: 8px 0; display: inline-block;">
+        🟡 <strong>WEAK</strong> — {pair_id.upper()}
+        </div>
+        """, unsafe_allow_html=True)
+    else:
+        st.markdown(f"""
+        <div style="background: linear-gradient(90deg, #8b0000, #dc143c); padding: 8px 12px; border-radius: 6px; margin: 8px 0; display: inline-block;">
+        🔴 <strong>UNSUITABLE</strong> — {pair_id.upper()}
+        </div>
+        """, unsafe_allow_html=True)
+    
+    # ====== KPI METRICS (PAIR-LABELED) - SAFE ACCESS ======
+    col1, col2, col3, col4 = st.columns(4)
+    
+    beta_val = snapshot.get('beta', 0)
+    zscore_val = snapshot.get('zscore', 0)
+    spread_val = snapshot.get('spread', 0)
+    corr_val = snapshot.get('correlation', 0)
+    ts_val = snapshot.get('timestamp', time.time())
+    
+    with col1:
+        st.metric(f"β ({pair_id})", f"{beta_val:.4f}" if is_ready else "—")
+    
+    with col2:
+        delta = "🚨 ALERT" if abs(zscore_val) >= z_threshold else "✅ OK"
+        st.metric(f"Z ({pair_id})", f"{zscore_val:.2f}" if is_ready else "—", delta=delta if is_ready else None)
+    
+    with col3:
+        st.metric(f"Spread ({pair_id})", f"{spread_val:.6f}" if is_ready else "—")
+    
+    with col4:
+        st.metric(f"ρ ({pair_id})", f"{corr_val:.2%}" if is_ready else "—")
+    
+    # ====== ALERT BANNER (PAIR-SPECIFIC) ======
+    if is_ready and abs(zscore_val) >= z_threshold:
+        st.error(f"⚠️ **{pair_id.upper()} ALERT**: Z-Score = {zscore_val:.2f} exceeds ±{z_threshold}")
+    
+    # ====== PREPARE PAIR-SPECIFIC DATAFRAME ======
+    # CRITICAL: This dataframe is scoped to THIS pair only
+    if is_ready and len(pair_history) > 1:
+        pair_df = pd.DataFrame(pair_history)
+        pair_df["time"] = pd.to_datetime(pair_df["timestamp"], unit="s").dt.strftime("%H:%M:%S")
+    elif is_ready:
+        pair_df = pd.DataFrame([snapshot])
+        pair_df["time"] = [time.strftime('%H:%M:%S', time.localtime(ts_val))]
+    else:
+        # Buffering - create empty placeholder dataframe
+        pair_df = pd.DataFrame({"time": [], "spread": [], "zscore": [], "beta": [], "correlation": []})
+    
+    # ====== RENDER STABILITY: Limit window and deduplicate ======
+    RENDER_WINDOW = 100  # Max points to display
+    
+    if len(pair_df) > 0:
+        # Deduplicate timestamps
+        pair_df = pair_df.drop_duplicates(subset=["time"], keep="last")
+        # Limit to last N points for stable rendering
+        pair_df = pair_df.tail(RENDER_WINDOW)
+        # PAIR-ISOLATED INDEX: Reset index and add unique t column
+        pair_df = pair_df.reset_index(drop=True)
+        pair_df["t"] = range(len(pair_df))
+    
+    # ====== ROW 1: SPREAD & Z-SCORE (ALWAYS RENDER) ======
+    row1_col1, row1_col2 = st.columns(2)
+    
+    with row1_col1:
+        # SPREAD CHART
+        if len(pair_df) >= 1:
+            fig_spread = go.Figure()
+            fig_spread.add_trace(go.Scatter(
+                x=pair_df["time"], 
+                y=pair_df["spread"],
+                mode="lines+markers",
+                name=f"Spread ({pair_id})",
+                line=dict(color="#00d4ff", width=2),
+                marker=dict(size=3)
+            ))
+            fig_spread.update_layout(
+                title=f"📉 Spread — {pair_id.upper()}",
+                xaxis_title="Time",
+                yaxis_title="Spread",
+                height=250,
+                template="plotly_dark",
+                margin=dict(l=10, r=10, t=40, b=40),
+                showlegend=False,
+                uirevision=f"spread_{pair_id}"  # Lock axes during reruns
+            )
+            st.plotly_chart(fig_spread, use_container_width=True, key=f"spread_{pair_id}")
+        else:
+            st.info(f"⏳ Waiting for spread data... ({pair_id})")
+    
+    with row1_col2:
+        # Z-SCORE CHART
+        if len(pair_df) >= 1:
+            fig_z = go.Figure()
+            fig_z.add_trace(go.Scatter(
+                x=pair_df["time"], 
+                y=pair_df["zscore"],
+                mode="lines+markers",
+                name=f"Z-Score ({pair_id})",
+                line=dict(color="#e94560", width=2),
+                marker=dict(size=3)
+            ))
+            fig_z.add_hline(y=z_threshold, line_dash="dash", line_color="#ffd60a", line_width=2,
+                           annotation_text=f"+{z_threshold}")
+            fig_z.add_hline(y=-z_threshold, line_dash="dash", line_color="#ffd60a", line_width=2,
+                           annotation_text=f"-{z_threshold}")
+            fig_z.add_hline(y=0, line_dash="dot", line_color="gray")
+            fig_z.update_layout(
+                title=f"📊 Z-Score — {pair_id.upper()}",
+                xaxis_title="Time",
+                yaxis_title="Z-Score (σ)",
+                height=250,
+                template="plotly_dark",
+                margin=dict(l=10, r=10, t=40, b=40),
+                showlegend=False,
+                uirevision=f"zscore_{pair_id}"
+            )
+            st.plotly_chart(fig_z, use_container_width=True, key=f"zscore_{pair_id}")
+        else:
+            st.info(f"⏳ Waiting for z-score data... ({pair_id})")
+    
+    # ====== ROW 2: BETA & CORRELATION (ALWAYS RENDER) ======
+    row2_col1, row2_col2 = st.columns(2)
+    
+    with row2_col1:
+        # BETA CHART
+        if len(pair_df) >= 1:
+            fig_beta = go.Figure()
+            fig_beta.add_trace(go.Scatter(
+                x=pair_df["time"], 
+                y=pair_df["beta"],
+                mode="lines+markers",
+                name=f"Beta ({pair_id})",
+                line=dict(color="#40916c", width=2),
+                marker=dict(size=3)
+            ))
+            fig_beta.add_hline(y=1.0, line_dash="dash", line_color="#ffd60a", line_width=1,
+                              annotation_text="β=1")
+            fig_beta.update_layout(
+                title=f"📈 Beta (β) — {pair_id.upper()}",
+                xaxis_title="Time",
+                yaxis_title="Hedge Ratio",
+                height=250,
+                template="plotly_dark",
+                margin=dict(l=10, r=10, t=40, b=40),
+                showlegend=False,
+                uirevision=f"beta_{pair_id}"
+            )
+            st.plotly_chart(fig_beta, use_container_width=True, key=f"beta_{pair_id}")
+        else:
+            st.info(f"⏳ Waiting for beta data... ({pair_id})")
+    
+    with row2_col2:
+        # CORRELATION CHART
+        if len(pair_df) >= 1:
+            fig_corr = go.Figure()
+            fig_corr.add_trace(go.Scatter(
+                x=pair_df["time"], 
+                y=pair_df["correlation"],
+                mode="lines+markers",
+                name=f"Correlation ({pair_id})",
+                line=dict(color="#9d4edd", width=2),
+                marker=dict(size=3)
+            ))
+            fig_corr.add_hline(y=0.7, line_dash="dash", line_color="#40916c", line_width=1,
+                              annotation_text="ρ=0.7 (valid)")
+            fig_corr.add_hline(y=-0.7, line_dash="dash", line_color="#40916c", line_width=1)
+            fig_corr.add_hline(y=0, line_dash="dot", line_color="gray")
+            fig_corr.update_layout(
+                title=f"🔗 Correlation (ρ) — {pair_id.upper()}",
+                xaxis_title="Time",
+                yaxis_title="Pearson ρ",
+                height=250,
+                template="plotly_dark",
+                margin=dict(l=10, r=10, t=40, b=40),
+                yaxis=dict(range=[-1.1, 1.1]),
+                showlegend=False,
+                uirevision=f"corr_{pair_id}"
+            )
+            st.plotly_chart(fig_corr, use_container_width=True, key=f"corr_{pair_id}")
+        else:
+            st.info(f"⏳ Waiting for correlation data... ({pair_id})")
+    
+    # ====== PAIR-SPECIFIC FOOTER ======
+    last_time = time.strftime('%H:%M:%S', time.localtime(ts_val)) if is_ready else "—"
+    st.caption(f"📍 {pair_id.upper()} | History: {len(pair_history)} pts | Last: {last_time}")
+    st.markdown("---")
 
-if corr >= 0.7 and beta < 5:
-    st.markdown("""
-    <div style="background: linear-gradient(90deg, #2d6a4f, #40916c); padding: 10px 15px; border-radius: 8px; margin: 10px 0;">
-    🟢 <strong>VALID PAIR</strong> — Strong correlation (ρ = {:.2f}), stable hedge ratio
-    </div>
-    """.format(state["correlation"]), unsafe_allow_html=True)
-elif corr >= 0.5:
-    st.markdown("""
-    <div style="background: linear-gradient(90deg, #b8860b, #daa520); padding: 10px 15px; border-radius: 8px; margin: 10px 0;">
-    🟡 <strong>WEAK RELATIONSHIP</strong> — Moderate correlation (ρ = {:.2f}), use caution
-    </div>
-    """.format(state["correlation"]), unsafe_allow_html=True)
-else:
-    st.markdown("""
-    <div style="background: linear-gradient(90deg, #8b0000, #dc143c); padding: 10px 15px; border-radius: 8px; margin: 10px 0;">
-    🔴 <strong>UNSUITABLE FOR STAT-ARB</strong> — Weak correlation (ρ = {:.2f}), hedge unreliable
-    </div>
-    """.format(state["correlation"]), unsafe_allow_html=True)
 
-
-# ========== KPI METRICS ==========
-st.markdown("### 📊 Live Metrics")
-
-col1, col2, col3, col4, col5 = st.columns(5)
-
-with col1:
-    st.metric("Pair", state["pair"])
-
-with col2:
-    st.metric("Beta (β)", f"{state['beta']:.4f}")
-
-with col3:
-    z = state["zscore"]
-    delta = "🚨 ALERT" if abs(z) >= z_threshold else "✅ OK"
-    st.metric("Z-Score", f"{z:.2f}", delta=delta)
-
-with col4:
-    st.metric("Spread", f"{state['spread']:.6f}")
-
-with col5:
-    st.metric("Correlation (ρ)", f"{state['correlation']:.2%}")
-
-
-# ========== ALERT BANNER ==========
-if abs(state["zscore"]) >= z_threshold:
-    st.error(f"⚠️ **ALERT**: Z-Score = {state['zscore']:.2f} exceeds ±{z_threshold} — Mean-reversion signal!")
-else:
-    st.success("✅ Z-Score within normal bounds")
-
+# ================== TABBED VIEW PER PAIR ==================
 st.markdown("---")
 
+# Sort pairs deterministically
+sorted_pair_ids = sorted(state.keys())
+active_pairs = len(sorted_pair_ids)
 
-# ================== ROLLING CHARTS ==================
-st.markdown("### 📈 Rolling Time Series")
-
-# Prepare history data
-if len(st.session_state.history) > 1:
-    df = pd.DataFrame(st.session_state.history)
-    df["time"] = pd.to_datetime(df["timestamp"], unit="s").dt.strftime("%H:%M:%S")
+# RULE: Always render tabs, even for 0 or 1 pair (stable structure)
+if active_pairs == 0:
+    # Still render a placeholder container
+    with st.container():
+        st.warning("No analytics data available yet")
+        st.empty()  # Placeholder for consistency
 else:
-    # Single point fallback
-    df = pd.DataFrame([state])
-    df["time"] = [time.strftime('%H:%M:%S', time.localtime(state["timestamp"]))]
+    # ALWAYS use tabs (even for single pair) - stable structure
+    tabs = st.tabs(sorted_pair_ids if active_pairs > 0 else ["Waiting..."])
+    
+    for i, pair_id in enumerate(sorted_pair_ids):
+        with tabs[i]:
+            snapshot = state[pair_id]
+            pair_history = st.session_state.history.get(pair_id, [])
+            
+            # ALWAYS render the same structure - readiness is handled INSIDE
+            is_ready = snapshot.get("ready", False)
+            
+            # Show buffering status FIRST if not ready (but don't skip the graphs)
+            if not is_ready:
+                st.info(f"""
+                ⏳ **{pair_id.upper()} — Buffering**
+                
+                | Symbol | Progress |
+                |--------|----------|
+                | {snapshot.get('x_symbol', '?')} | {snapshot.get('x_count', 0)}/{snapshot.get('window', 200)} ({snapshot.get('x_pct', 0)}%) |
+                | {snapshot.get('y_symbol', '?')} | {snapshot.get('y_count', 0)}/{snapshot.get('window', 200)} ({snapshot.get('y_pct', 0)}%) |
+                """)
+            
+            # ALWAYS render the pair analytics (function handles empty state internally)
+            render_pair_analytics(pair_id, snapshot, pair_history, z_threshold, window_size)
 
 
-# Row 1: Spread and Z-Score
-chart_col1, chart_col2 = st.columns(2)
-
-with chart_col1:
-    fig_spread = go.Figure()
-    fig_spread.add_trace(go.Scatter(
-        x=df["time"], y=df["spread"],
-        mode="lines+markers",
-        name="Spread",
-        line=dict(color="#00d4ff", width=2),
-        marker=dict(size=3)
-    ))
-    if len(df) > 1:
-        mean_spread = df["spread"].mean()
-        fig_spread.add_hline(y=mean_spread, line_dash="dot", line_color="yellow",
-                            annotation_text=f"μ={mean_spread:.6f}")
-    fig_spread.update_layout(
-        title="📉 Spread Time Series",
-        xaxis_title="Time",
-        yaxis_title="Spread",
-        height=350,
-        template="plotly_dark",
-        margin=dict(l=10, r=10, t=50, b=40)
-    )
-    st.plotly_chart(fig_spread, use_container_width=True)
-
-with chart_col2:
-    fig_z = go.Figure()
-    fig_z.add_trace(go.Scatter(
-        x=df["time"], y=df["zscore"],
-        mode="lines+markers",
-        name="Z-Score",
-        line=dict(color="#e94560", width=2),
-        marker=dict(size=3)
-    ))
-    # Threshold bands
-    fig_z.add_hline(y=z_threshold, line_dash="dash", line_color="#ffd60a", line_width=2,
-                    annotation_text=f"+{z_threshold}")
-    fig_z.add_hline(y=-z_threshold, line_dash="dash", line_color="#ffd60a", line_width=2,
-                    annotation_text=f"-{z_threshold}")
-    fig_z.add_hline(y=0, line_dash="dot", line_color="gray")
-    fig_z.update_layout(
-        title="📊 Z-Score with Alert Bands",
-        xaxis_title="Time",
-        yaxis_title="Z-Score (σ)",
-        height=350,
-        template="plotly_dark",
-        margin=dict(l=10, r=10, t=50, b=40)
-    )
-    st.plotly_chart(fig_z, use_container_width=True)
-
-
-# Row 2: Beta and Correlation
-chart_col3, chart_col4 = st.columns(2)
-
-with chart_col3:
-    fig_beta = go.Figure()
-    fig_beta.add_trace(go.Scatter(
-        x=df["time"], y=df["beta"],
-        mode="lines+markers",
-        name="Beta",
-        line=dict(color="#7b2cbf", width=2),
-        marker=dict(size=3),
-        fill="tozeroy",
-        fillcolor="rgba(123, 44, 191, 0.15)"
-    ))
-    fig_beta.update_layout(
-        title="📐 Rolling Hedge Ratio (β)",
-        xaxis_title="Time",
-        yaxis_title="Beta",
-        height=300,
-        template="plotly_dark",
-        margin=dict(l=10, r=10, t=50, b=40)
-    )
-    st.plotly_chart(fig_beta, use_container_width=True)
-
-with chart_col4:
-    fig_corr = go.Figure()
-    fig_corr.add_trace(go.Scatter(
-        x=df["time"], y=df["correlation"],
-        mode="lines+markers",
-        name="Correlation",
-        line=dict(color="#3a86ff", width=2),
-        marker=dict(size=3),
-        fill="tozeroy",
-        fillcolor="rgba(58, 134, 255, 0.15)"
-    ))
-    fig_corr.update_layout(
-        title="🔗 Rolling Correlation (ρ)",
-        xaxis_title="Time",
-        yaxis_title="Correlation",
-        height=300,
-        template="plotly_dark",
-        margin=dict(l=10, r=10, t=50, b=40),
-        yaxis=dict(range=[-1.1, 1.1])
-    )
-    st.plotly_chart(fig_corr, use_container_width=True)
-
-
+# ================== GLOBAL: EXPORTS & LOGS (OUTSIDE PAIR LOOP) ==================
 st.markdown("---")
+st.subheader("📤 Exports & Logs")
 
-
-# ================== DATA EXPORT ==========
-st.markdown("### 📥 Data Export")
+# Check if all pairs are ready
+all_ready = all(s.get("ready", False) for s in state.values()) if state else False
+if state and not all_ready:
+    st.warning("⚠️ **Some pairs still buffering** — exports may be incomplete")
 
 exp_col1, exp_col2, exp_col3 = st.columns(3)
 
 with exp_col1:
-    csv_data = f"timestamp,pair,alpha,beta,spread,zscore,correlation\n"
-    csv_data += f"{state['timestamp']},{state['pair']},{state['alpha']},{state['beta']},{state['spread']},{state['zscore']},{state['correlation']}"
-    st.download_button(
-        "💾 Download Snapshot",
-        data=csv_data,
-        file_name=f"snapshot_{state['pair'].replace('/', '_')}_{int(state['timestamp'])}.csv",
-        mime="text/csv",
-        use_container_width=True
-    )
-
-with exp_col2:
-    if st.session_state.history:
+    # Combined analytics state download
+    if state:
         st.download_button(
-            "📊 Download History",
-            data=json.dumps(st.session_state.history, indent=2),
-            file_name=f"history_{state['pair'].replace('/', '_')}_{int(time.time())}.json",
+            "📊 Download State (JSON)",
+            data=json.dumps(state, indent=2),
+            file_name=f"analytics_state_{int(time.time())}.json",
             mime="application/json",
-            use_container_width=True
+            use_container_width=True,
+            key="download_state"
         )
 
+with exp_col2:
+    # Combined history download
+    all_histories = st.session_state.history
+    if any(len(h) > 0 for h in all_histories.values()):
+        # Build combined dataframe
+        rows = []
+        for pair_id, hist in all_histories.items():
+            for h in hist:
+                rows.append({**h, "pair": pair_id})
+        
+        if rows:
+            history_df = pd.DataFrame(rows)
+            csv_data = history_df.to_csv(index=False)
+            st.download_button(
+                "📈 Download History (CSV)",
+                data=csv_data,
+                file_name=f"analytics_history_{int(time.time())}.csv",
+                mime="text/csv",
+                use_container_width=True,
+                key="download_history"
+            )
+
 with exp_col3:
-    st.metric("History Points", len(st.session_state.history))
+    # Count total history points
+    total_points = sum(len(h) for h in all_histories.values())
+    st.metric("Total History", f"{total_points} pts")
 
+# ================== GLOBAL: RECENT ANALYTICS LOG ==================
+# Combine all histories for log table
+all_recent = []
+for pair_id, hist in st.session_state.history.items():
+    for h in hist[-10:]:  # Last 10 per pair
+        all_recent.append({
+            "pair": pair_id.upper(),
+            "beta": h.get("beta", 0),
+            "zscore": h.get("zscore", 0),
+            "spread": h.get("spread", 0),
+            "correlation": h.get("correlation", 0),
+            "timestamp": h.get("timestamp", 0)
+        })
 
-# ================== RECENT LOG TABLE ==========
-if len(st.session_state.history) > 5:
-    st.markdown("### 📋 Recent Analytics Log")
+if len(all_recent) > 0:
+    st.markdown("### 📋 Recent Analytics Log (All Pairs)")
     
-    log_df = pd.DataFrame(st.session_state.history[-25:])
+    log_df = pd.DataFrame(all_recent)
     log_df["time"] = pd.to_datetime(log_df["timestamp"], unit="s").dt.strftime("%H:%M:%S")
+    log_df = log_df.sort_values("timestamp", ascending=False).head(25)
     log_df = log_df[["time", "pair", "beta", "zscore", "spread", "correlation"]]
     log_df.columns = ["Time", "Pair", "Beta", "Z-Score", "Spread", "Correlation"]
     
@@ -568,14 +806,15 @@ if len(st.session_state.history) > 5:
         "Z-Score": "{:.2f}",
         "Spread": "{:.6f}",
         "Correlation": "{:.2%}"
-    }).applymap(highlight_zscore, subset=["Z-Score"])
+    }).map(highlight_zscore, subset=["Z-Score"])
     
     st.dataframe(styled_df, use_container_width=True)
 
 
 # ================== FOOTER ==========
 st.markdown("---")
-st.caption(f"🔒 Read-only dashboard | Active: {state['pair']} | Window: {window_size}")
+st.caption(f"🔒 Read-only dashboard | {len(state)} pairs active | Window: {window_size} | Refresh: {refresh_rate}s")
+st.caption("ℹ️ β and ρ are rolling tick-aligned estimates — rapid variation is expected under microstructure noise.")
 
 
 # ================== AUTO REFRESH ==========

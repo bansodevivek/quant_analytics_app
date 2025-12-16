@@ -36,8 +36,11 @@ class BinanceIngestor:
         self._loop: Optional[asyncio.AbstractEventLoop] = None
 
     async def _connect_symbol(self, symbol: str):
-        url = f"wss://stream.binance.com:9443/ws/{symbol}@trade"
+        # Use Binance Futures endpoint (not Spot)
+        url = f"wss://fstream.binance.com/ws/{symbol}@trade"
         backoff = 1
+        max_retries = 5
+        retry_count = 0
 
         while self._running:
             try:
@@ -50,6 +53,7 @@ class BinanceIngestor:
                 ) as ws:
                     logger.info(f"[INGEST] ✓ Connected to {symbol}")
                     backoff = 1
+                    retry_count = 0
 
                     async for msg in ws:
                         if not self._running:
@@ -70,10 +74,28 @@ class BinanceIngestor:
             except asyncio.CancelledError:
                 logger.info(f"[INGEST] {symbol} task cancelled")
                 break
+            except websockets.exceptions.InvalidStatusCode as e:
+                retry_count += 1
+                if e.status_code == 400:
+                    logger.error(f"[INGEST] ❌ {symbol.upper()} - Invalid symbol (HTTP 400)")
+                    if retry_count >= max_retries:
+                        logger.error(f"[INGEST] ❌ {symbol.upper()} - Giving up after {max_retries} failures")
+                        break
+                elif e.status_code == 451:
+                    logger.error(f"[INGEST] ❌ {symbol.upper()} - Unavailable in your region (HTTP 451)")
+                    break
+                else:
+                    logger.warning(f"[INGEST] {symbol} HTTP error: {e.status_code}")
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, 30)
             except Exception as e:
                 if not self._running:
                     break
+                retry_count += 1
                 logger.warning(f"[INGEST] {symbol} error: {e}")
+                if retry_count >= max_retries:
+                    logger.error(f"[INGEST] ❌ {symbol.upper()} - Max retries exceeded")
+                    break
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, 30)
 

@@ -37,10 +37,16 @@ class AnalyticsEngine:
         if len(ticks) < self.window_size:
             return None
 
+        # Extract last N prices
         prices = np.array(
             [t.price for t in ticks[-self.window_size:]],
             dtype=np.float64
         )
+        
+        # Filter out zero/negative prices (prevents log errors)
+        prices = prices[prices > 0]
+        if len(prices) < self.window_size:
+            return None
 
         return np.log(prices)
 
