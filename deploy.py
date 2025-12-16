@@ -30,6 +30,13 @@ from analytics import AnalyticsEngine, run_adf_test, compute_half_life
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("deploy")
 
+# Page Config (MUST BE FIRST)
+st.set_page_config(
+    page_title="Quant Analytics Dashboard",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
 # ---------------- CONSTANTS ----------------
 HISTORY_MAX_LEN = 500
 ANALYTICS_INTERVAL = 0.5
@@ -198,13 +205,6 @@ backend = BackendService()
 
 
 # ---------------- FRONTEND LOGIC (Copied from streamlit_app.py) ----------------
-
-# Page Config
-st.set_page_config(
-    page_title="Quant Analytics Dashboard",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
 
 # Custom CSS
 st.markdown("""
