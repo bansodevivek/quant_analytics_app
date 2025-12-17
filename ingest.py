@@ -13,6 +13,7 @@ import asyncio
 import json
 import time
 import logging
+import threading
 from typing import List, Optional
 
 import websockets
@@ -141,7 +142,6 @@ class IngestionManager:
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._current_symbols: List[str] = []
         self._lock = asyncio.Lock() if hasattr(asyncio, 'Lock') else None
-        import threading
         self._thread_lock = threading.Lock()
 
     def _run_async_loop(self, symbols: List[str]):
@@ -161,7 +161,6 @@ class IngestionManager:
 
     def start(self, symbols: List[str]):
         """Start ingestion for given symbols."""
-        import threading
         
         with self._thread_lock:
             self._current_symbols = [s.lower() for s in symbols]

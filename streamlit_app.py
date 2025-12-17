@@ -227,64 +227,63 @@ with st.sidebar:
     # ========== START / STOP BUTTONS ==========
     st.subheader("🎮 Control")
     
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        start_clicked = st.button(
-            "▶️ Start",
-            disabled=is_running or len(validation_errors) > 0,
-            use_container_width=True,
-            type="primary"
-        )
-    
-    with col2:
-        stop_clicked = st.button(
-            "⏹️ Stop",
-            disabled=not is_running,
-            use_container_width=True
-        )
-    
-    # ========== START LOGIC ==========
-    if start_clicked and len(validation_errors) == 0:
-        # Get unique symbols for ingestion
-        unique_symbols = list(set([final_base] + [p[0] for p in pairs]))
-        
-        # Reset state
-        st.session_state.running = True
-        st.session_state.pairs = pairs
-        st.session_state.history = {f"{p[0]}/{p[1]}": [] for p in pairs}
-        
-        # Clear old state files
-        if STATE_PATH.exists():
-            STATE_PATH.unlink()
-        with open(HISTORY_PATH, "w") as f:
-            json.dump({}, f)
-        
-        # Write control signal
-        with open(CONTROL_PATH, "w") as f:
-            json.dump({
-                "action": "START",
-                "base": final_base,
-                "compare": all_compare,
-                "pairs": pairs,
-                "unique_symbols": unique_symbols,
-                "window_size": window_size,
-                "timestamp": time.time()
-            }, f)
-        
-        st.rerun()
-    
-    # ========== STOP LOGIC ==========
-    if stop_clicked:
+    # ========== CALLBACKS ==========
+    def start_callback():
+        if len(validation_errors) == 0:
+            # Get unique symbols for ingestion
+            unique_symbols = list(set([final_base] + [p[0] for p in pairs]))
+            
+            # Reset state
+            st.session_state.running = True
+            st.session_state.pairs = pairs
+            st.session_state.history = {f"{p[0]}/{p[1]}": [] for p in pairs}
+            
+            # Clear old state files
+            if STATE_PATH.exists():
+                STATE_PATH.unlink()
+            with open(HISTORY_PATH, "w") as f:
+                json.dump({}, f)
+                
+            # Write control signal
+            with open(CONTROL_PATH, "w") as f:
+                json.dump({
+                    "action": "START",
+                    "base": final_base,
+                    "compare": all_compare,
+                    "pairs": pairs,
+                    "unique_symbols": unique_symbols,
+                    "window_size": window_size,
+                    "timestamp": time.time()
+                }, f)
+
+    def stop_callback():
         st.session_state.running = False
-        
         with open(CONTROL_PATH, "w") as f:
             json.dump({
                 "action": "STOP",
                 "timestamp": time.time()
             }, f)
-        
-        st.rerun()
+
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        st.button(
+            "▶️ Start",
+            disabled=is_running or len(validation_errors) > 0,
+            use_container_width=True,
+            type="primary",
+            on_click=start_callback,
+            key="start_btn"
+        )
+    
+    with col2:
+        st.button(
+            "⏹️ Stop",
+            disabled=not is_running,
+            use_container_width=True,
+            on_click=stop_callback,
+            key="stop_btn"
+        )
     
     # ========== STATUS INDICATOR ==========
     st.divider()
@@ -900,46 +899,61 @@ all_ready = all(s.get("ready", False) for s in state.values()) if state else Fal
 if state and not all_ready:
     st.warning("⚠️ **Some pairs still buffering** — exports may be incomplete")
 
+# Compute data once
+total_history = sum(len(h) for h in st.session_state.history.values())
+
 exp_col1, exp_col2, exp_col3 = st.columns(3)
 
 with exp_col1:
-    # Combined analytics state download
-    if state:
-        json_data = json.dumps(state, indent=2)
+    # JSON STATE DOWNLOAD (IN-MEMORY BYTES)
+    state_ready = state is not None and len(state) > 0
+    
+    if state_ready:
+        json_bytes = json.dumps(state, indent=2).encode("utf-8")
+        
         st.download_button(
-            "📊 Download State (JSON)",
-            data=json_data,
+            label="📊 Download State (JSON)",
+            data=json_bytes,
             file_name="analytics_state.json",
             mime="application/json",
             use_container_width=True,
-            key="global_download_state"
+            key="download_state_json"
         )
+    else:
+        st.info("⏳ No state yet")
 
 with exp_col2:
-    # Combined history download
-    all_histories = st.session_state.history
-    if any(len(h) > 0 for h in all_histories.values()):
+    # CSV HISTORY DOWNLOAD (IN-MEMORY BYTES)
+    if total_history > 0:
         rows = []
-        for pair_id, hist in all_histories.items():
+        for pair_id, hist in st.session_state.history.items():
             for h in hist:
-                rows.append({**h, "pair": pair_id})
+                rows.append({
+                    "timestamp": h.get("timestamp", 0),
+                    "pair": pair_id,
+                    "spread": h.get("spread", 0),
+                    "zscore": h.get("zscore", 0),
+                    "beta": h.get("beta", 0),
+                    "correlation": h.get("correlation", 0)
+                })
         
         if rows:
             history_df = pd.DataFrame(rows)
-            csv_data = history_df.to_csv(index=False)
+            csv_bytes = history_df.to_csv(index=False).encode("utf-8")
+            
             st.download_button(
-                "📈 Download History (CSV)",
-                data=csv_data,
+                label="📈 Download History (CSV)",
+                data=csv_bytes,
                 file_name="analytics_history.csv",
                 mime="text/csv",
                 use_container_width=True,
-                key="global_download_history"
+                key="download_history_csv"
             )
+    else:
+        st.info("⏳ No history yet")
 
 with exp_col3:
-    # Count total history points - GLOBAL ONLY, keyed to prevent duplicates
-    total_points = sum(len(h) for h in all_histories.values())
-    st.metric("Total History", f"{total_points} pts", help="Combined across all pairs")
+    st.metric("Total History", f"{total_history} pts", help="Combined across all pairs")
 
 # ================== GLOBAL: RECENT ANALYTICS LOG (SCROLLABLE, STABLE) ==================
 # Wrap in single column to create stable structure (prevents duplicates on reruns)
